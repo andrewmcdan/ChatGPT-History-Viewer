@@ -4,6 +4,7 @@ ChatGPT History Viewer is a desktop utility for browsing exported ChatGPT conver
 
 ## Features
 - Load any ChatGPT `conversations.json` export via the File menu.
+- Optional ChatGPT Projects support: import `projects.json` to populate project names and filter conversations by project.
 - Automatic deduplication: newer snapshots replace older records on import.
 - Persisted storage in SQLite (`chat_history.db`) for quick startup and search.
 - Conversation list sorted by most recent activity with timestamps.
@@ -27,6 +28,7 @@ ChatGPT History Viewer is a desktop utility for browsing exported ChatGPT conver
    - Choose *File → Load conversations.json…*.
    - Pick one of your exported ChatGPT history files.
    - The status bar shows import progress and the conversation list refreshes when done.
+   - (Optional) Load *projects.json* to enrich the UI with project names and enable project-level filtering.
 
 4. **Browse & search**
    - Click a title in the left pane to render the full thread.
@@ -34,10 +36,11 @@ ChatGPT History Viewer is a desktop utility for browsing exported ChatGPT conver
 
 ## Data Storage
 - The application stores imported data in `chat_history.db` in the project root.
+- Projects (when imported) live in the same database alongside conversations and messages.
 - You can safely delete the database to start fresh (you will need to re-import exports).
 
 ## Development Notes
-- The schema is defined in `database.py`; all read/write access routes through `ChatHistoryDatabase`.
+- The schema is defined in `database.py`; all read/write access routes through `ChatHistoryDatabase` (including the optional `projects` table).
 - UI behaviour and interaction wiring live in `main.py`.
 - `python -m compileall .` can be used for a quick syntax check without launching the UI.
 

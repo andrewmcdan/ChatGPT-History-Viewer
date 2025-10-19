@@ -2,7 +2,7 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -26,6 +26,7 @@ INLINE_PATTERN = re.compile(r"(\*\*.+?\*\*|__.+?__|`.+?`|\*[^*]+\*|_[^_]+_)")
 
 APP_TITLE = "ChatGPT History Viewer"
 DEFAULT_DB_PATH = Path("chat_history.db")
+ALL_PROJECTS_OPTION = "All projects"
 
 
 class ChatHistoryViewer(tk.Tk):
@@ -39,12 +40,17 @@ class ChatHistoryViewer(tk.Tk):
 
         self.search_var = tk.StringVar()
         self.show_meta_var = tk.BooleanVar(value=False)
+        self.project_filter_var = tk.StringVar(value=ALL_PROJECTS_OPTION)
         self.status_var = tk.StringVar(value="Ready")
         self.conversation_title_var = tk.StringVar(value="Select a conversation to view its messages.")
+        self.project_filter_map: Dict[str, Optional[str]] = {ALL_PROJECTS_OPTION: None}
+        self.project_lookup: Dict[str, str] = {}
+        self.projects: List[dict] = []
 
         self._build_ui()
         self._bind_events()
 
+        self.refresh_project_choices()
         self.refresh_conversation_list()
 
     # ------------------------------------------------------------------ UI init
@@ -63,6 +69,7 @@ class ChatHistoryViewer(tk.Tk):
 
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Load conversations.json...", command=self._select_json_file)
+        file_menu.add_command(label="Load projects.json...", command=self._select_projects_file)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
 
@@ -87,6 +94,17 @@ class ChatHistoryViewer(tk.Tk):
             variable=self.show_meta_var,
             command=self.on_toggle_meta,
         ).grid(row=0, column=4, padx=(12, 0))
+        ttk.Label(search_frame, text="Project:").grid(row=0, column=5, padx=(12, 6))
+        self.project_filter = ttk.Combobox(
+            search_frame,
+            state="readonly",
+            textvariable=self.project_filter_var,
+            values=[ALL_PROJECTS_OPTION],
+            width=28,
+        )
+        self.project_filter.grid(row=0, column=6, sticky="ew")
+        self.project_filter.current(0)
+        self.project_filter.bind("<<ComboboxSelected>>", self.on_project_filter_changed)
 
     def _build_paned_layout(self) -> None:
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -197,17 +215,85 @@ class ChatHistoryViewer(tk.Tk):
 
     # ---------------------------------------------------------------- actions
 
+    def refresh_project_choices(self) -> None:
+        rows = self.db.list_projects()
+        self.projects = [
+            {
+                "project_id": row["project_id"],
+                "name": row["name"],
+                "description": row["description"],
+                "create_time": row["create_time"],
+                "update_time": row["update_time"],
+            }
+            for row in rows
+        ]
+
+        mapping: Dict[str, Optional[str]] = {ALL_PROJECTS_OPTION: None}
+        values = [ALL_PROJECTS_OPTION]
+        lookup: Dict[str, str] = {}
+
+        for row in self.projects:
+            project_id = row["project_id"]
+            if not project_id:
+                continue
+            base_name = (row["name"] or "").strip()
+            if not base_name:
+                base_name = f"Project {project_id[:8]}"
+            lookup[project_id] = base_name
+
+            display_name = base_name
+            suffix = 1
+            id_hint = project_id[:8]
+            while display_name in mapping:
+                extra = id_hint if suffix == 1 else f"{id_hint}-{suffix}"
+                display_name = f"{base_name} ({extra})"
+                suffix += 1
+
+            mapping[display_name] = project_id
+            values.append(display_name)
+
+        previous_selection = self.project_filter_var.get()
+        self.project_filter_map = mapping
+        self.project_lookup = lookup
+        self.project_filter["values"] = values
+
+        if previous_selection not in mapping:
+            previous_selection = ALL_PROJECTS_OPTION
+        self.project_filter_var.set(previous_selection)
+        self.project_filter.set(previous_selection)
+
+    def _current_project_id(self) -> Optional[str]:
+        return self.project_filter_map.get(self.project_filter_var.get())
+
+    def _project_label(self, project_id: Optional[str]) -> Optional[str]:
+        if not project_id:
+            return None
+        label = self.project_lookup.get(project_id)
+        if label:
+            return label
+        if isinstance(project_id, str) and project_id:
+            return project_id[:8]
+        return None
+
     def refresh_conversation_list(self, query: Optional[str] = None) -> None:
+        project_id = self._current_project_id()
         if query:
-            rows = self.db.search_conversations(query)
-            self.status_var.set(f"Search results: {len(rows)} conversation(s) matching '{query}'.")
+            rows = self.db.search_conversations(query, project_id=project_id)
+            status_message = f"Search results: {len(rows)} conversation(s) matching '{query}'."
         else:
-            rows = self.db.list_conversations()
-            self.status_var.set(f"Loaded {len(rows)} conversations.")
+            rows = self.db.list_conversations(project_id=project_id)
+            status_message = f"Loaded {len(rows)} conversations."
+
+        if project_id:
+            project_label = self._project_label(project_id) or project_id
+            status_message += f" (Project: {project_label})"
+
+        self.status_var.set(status_message)
 
         self.conversation_rows = [
             {
                 "conversation_id": row["conversation_id"],
+                "project_id": row["project_id"],
                 "title": row["title"],
                 "create_time": row["create_time"],
                 "update_time": row["update_time"],
@@ -217,10 +303,15 @@ class ChatHistoryViewer(tk.Tk):
 
         self.conversation_listbox.delete(0, tk.END)
 
+        filtering_by_project = project_id is not None
+
         for row in self.conversation_rows:
             title = row["title"] or "(Untitled conversation)"
             timestamp = format_timestamp(row["update_time"]) or format_timestamp(row["create_time"]) or ""
-            display_text = f"{title}"
+            display_text = title
+            project_label = self._project_label(row.get("project_id"))
+            if project_label and not filtering_by_project:
+                display_text = f"[{project_label}] {display_text}"
             if timestamp:
                 display_text += f"  —  {timestamp}"
             self.conversation_listbox.insert(tk.END, display_text)
@@ -243,6 +334,13 @@ class ChatHistoryViewer(tk.Tk):
         self.search_var.set("")
         self.refresh_conversation_list()
 
+    def on_project_filter_changed(self, event: Optional[tk.Event] = None) -> None:
+        selection = self.project_filter_var.get()
+        if selection not in self.project_filter_map:
+            self.project_filter_var.set(ALL_PROJECTS_OPTION)
+        query = self.search_var.get().strip()
+        self.refresh_conversation_list(query if query else None)
+
     def on_toggle_meta(self) -> None:
         self.on_conversation_selected()
 
@@ -257,9 +355,16 @@ class ChatHistoryViewer(tk.Tk):
         row = self.conversation_rows[index]
         title = row["title"] or "(Untitled conversation)"
         timestamp = format_timestamp(row["update_time"]) or format_timestamp(row["create_time"])
+        project_label = self._project_label(row.get("project_id"))
 
-        header = title if not timestamp else f"{title}  —  {timestamp}"
-        self.conversation_title_var.set(header)
+        header_parts = []
+        if project_label:
+            header_parts.append(f"[{project_label}]")
+        header_parts.append(title)
+        if timestamp:
+            header_parts.append(timestamp)
+
+        self.conversation_title_var.set("  —  ".join(header_parts))
 
         messages = self.db.get_conversation_messages(row["conversation_id"])
         self._render_conversation_messages(messages)
@@ -514,6 +619,39 @@ class ChatHistoryViewer(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _select_projects_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Select projects.json",
+            filetypes=[
+                ("JSON files", "*.json"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+        self._import_projects_file(Path(file_path))
+
+    def _import_projects_file(self, path: Path) -> None:
+        self.status_var.set(f"Importing {path.name}...")
+
+        def worker() -> None:
+            try:
+                def progress(current: int, total: int) -> None:
+                    self.after(
+                        0,
+                        lambda: self.status_var.set(
+                            f"Importing {path.name}: {current}/{total} projects..."
+                        ),
+                    )
+
+                stats = self.db.import_projects_json(path, progress_callback=progress)
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._handle_project_import_error(path, exc))
+            else:
+                self.after(0, lambda: self._handle_project_import_success(path, stats))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _handle_import_success(self, path: Path, stats: dict) -> None:
         inserted = stats.get("inserted", 0)
         updated = stats.get("updated", 0)
@@ -521,11 +659,26 @@ class ChatHistoryViewer(tk.Tk):
         self.status_var.set(
             f"Import complete: {inserted} inserted, {updated} updated, {skipped} skipped from {path.name}."
         )
+        self.refresh_project_choices()
         self.refresh_conversation_list(self.search_var.get().strip() or None)
 
     def _handle_import_error(self, path: Path, error: Exception) -> None:
         messagebox.showerror("Import failed", f"Could not import {path}.\n\n{error}")
         self.status_var.set("Import failed.")
+
+    def _handle_project_import_success(self, path: Path, stats: dict) -> None:
+        inserted = stats.get("inserted", 0)
+        updated = stats.get("updated", 0)
+        skipped = stats.get("skipped", 0)
+        self.status_var.set(
+            f"Project import complete: {inserted} inserted, {updated} updated, {skipped} skipped from {path.name}."
+        )
+        self.refresh_project_choices()
+        self.refresh_conversation_list(self.search_var.get().strip() or None)
+
+    def _handle_project_import_error(self, path: Path, error: Exception) -> None:
+        messagebox.showerror("Project import failed", f"Could not import {path}.\n\n{error}")
+        self.status_var.set("Project import failed.")
 
     # ---------------------------------------------------------------- cleanup
 

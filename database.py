@@ -7,6 +7,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 MessageTuple = Tuple[str, Optional[str], Dict[str, Any]]
 
+NON_SEARCHABLE_CONTENT_TYPES = {
+    "user_editable_context",
+}
+
 
 class ChatHistoryDatabase:
     """
@@ -23,6 +27,7 @@ class ChatHistoryDatabase:
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._ensure_schema()
+        self._purge_non_searchable_text()
 
     def close(self) -> None:
         with self._lock:
@@ -34,18 +39,36 @@ class ChatHistoryDatabase:
             self.conn.execute("PRAGMA foreign_keys=ON;")
             self.conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    description TEXT,
+                    create_time REAL,
+                    update_time REAL,
+                    default_model_slug TEXT,
+                    raw_metadata TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS conversations (
                     conversation_id TEXT PRIMARY KEY,
+                    project_id TEXT,
                     title TEXT,
                     create_time REAL,
                     update_time REAL,
                     default_model_slug TEXT,
                     is_archived INTEGER,
                     is_starred INTEGER,
-                    raw_metadata TEXT
+                    raw_metadata TEXT,
+                    FOREIGN KEY (project_id)
+                        REFERENCES projects(project_id)
+                        ON DELETE SET NULL
                 )
                 """
             )
+            self._ensure_column("conversations", "project_id", "TEXT")
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -71,11 +94,38 @@ class ChatHistoryDatabase:
             )
             self.conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_conversations_project
+                ON conversations(project_id)
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_messages_text
                 ON messages(text_content)
                 """
             )
             self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if not any(row["name"] == column for row in existing):
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _purge_non_searchable_text(self) -> None:
+        if not NON_SEARCHABLE_CONTENT_TYPES:
+            return
+        placeholders = ",".join("?" for _ in NON_SEARCHABLE_CONTENT_TYPES)
+        with self._lock, self.conn:
+            self.conn.execute(
+                f"""
+                UPDATE messages
+                SET text_content = ''
+                WHERE content_type IN ({placeholders})
+                  AND text_content IS NOT NULL
+                  AND text_content <> ''
+                """,
+                tuple(NON_SEARCHABLE_CONTENT_TYPES),
+            )
 
     # ------------------------------------------------------------------ import
 
@@ -114,6 +164,46 @@ class ChatHistoryDatabase:
 
         return {"inserted": inserted, "updated": updated, "skipped": skipped}
 
+    def import_projects_json(
+        self,
+        json_path: Path,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, int]:
+        """
+        Import ChatGPT project metadata from projects.json exports.
+        """
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"JSON file not found: {json_path}")
+
+        with json_path.open("r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+
+        if isinstance(payload, dict) and "projects" in payload:
+            projects = payload["projects"]
+        else:
+            projects = payload
+
+        if not isinstance(projects, list):
+            raise ValueError("projects.json is expected to contain a list of project objects.")
+
+        total = len(projects)
+        inserted = updated = skipped = 0
+
+        for index, project in enumerate(projects, start=1):
+            action = self._upsert_project(project)
+            if action == "inserted":
+                inserted += 1
+            elif action == "updated":
+                updated += 1
+            else:
+                skipped += 1
+
+            if progress_callback:
+                progress_callback(index, total)
+
+        return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
     def _upsert_conversation(self, conversation: Dict[str, Any]) -> str:
         conversation_id = (
             conversation.get("conversation_id") or conversation.get("id")
@@ -122,6 +212,7 @@ class ChatHistoryDatabase:
             return "skipped"
 
         update_time = _as_float(conversation.get("update_time"))
+        project_id = _extract_project_id(conversation)
 
         with self._lock:
             row = self.conn.execute(
@@ -147,6 +238,7 @@ class ChatHistoryDatabase:
                 "gizmo_type": conversation.get("gizmo_type"),
                 "plugin_ids": conversation.get("plugin_ids"),
                 "disabled_tool_ids": conversation.get("disabled_tool_ids"),
+                "project_snapshot": conversation.get("project"),
             }
 
             with self.conn:
@@ -154,6 +246,7 @@ class ChatHistoryDatabase:
                     """
                     INSERT INTO conversations (
                         conversation_id,
+                        project_id,
                         title,
                         create_time,
                         update_time,
@@ -162,8 +255,9 @@ class ChatHistoryDatabase:
                         is_starred,
                         raw_metadata
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(conversation_id) DO UPDATE SET
+                        project_id = excluded.project_id,
                         title = excluded.title,
                         create_time = excluded.create_time,
                         update_time = excluded.update_time,
@@ -174,6 +268,7 @@ class ChatHistoryDatabase:
                     """,
                     (
                         conversation_id,
+                        project_id,
                         conversation.get("title"),
                         _as_float(conversation.get("create_time")),
                         update_time,
@@ -228,35 +323,130 @@ class ChatHistoryDatabase:
 
         return "updated" if row is not None else "inserted"
 
+    def _upsert_project(self, project: Dict[str, Any]) -> str:
+        project_id = project.get("project_id") or project.get("id")
+        if not project_id:
+            return "skipped"
+
+        update_time = (
+            _as_float(project.get("update_time"))
+            or _as_float(project.get("updated_at"))
+            or _as_float(project.get("modified_time"))
+        )
+
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT update_time FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+
+            if row is not None:
+                stored_update = _as_float(row["update_time"])
+                if stored_update is not None and update_time is not None and stored_update >= update_time:
+                    return "skipped"
+
+            name = project.get("title") or project.get("name")
+            description = project.get("description") or project.get("summary")
+            create_time = (
+                _as_float(project.get("create_time"))
+                or _as_float(project.get("created_at"))
+                or _as_float(project.get("creation_time"))
+            )
+            default_model = (
+                project.get("default_model_slug")
+                or project.get("default_model")
+                or project.get("model")
+            )
+
+            metadata = {
+                "team_id": project.get("team_id"),
+                "visibility": project.get("visibility"),
+                "archived": project.get("archived"),
+                "owner_id": project.get("owner_id"),
+                "raw": project,
+            }
+
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO projects (
+                        project_id,
+                        name,
+                        description,
+                        create_time,
+                        update_time,
+                        default_model_slug,
+                        raw_metadata
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                        name = excluded.name,
+                        description = excluded.description,
+                        create_time = COALESCE(excluded.create_time, projects.create_time),
+                        update_time = excluded.update_time,
+                        default_model_slug = excluded.default_model_slug,
+                        raw_metadata = excluded.raw_metadata
+                    """,
+                    (
+                        project_id,
+                        name,
+                        description,
+                        create_time,
+                        update_time,
+                        default_model,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+
+        return "updated" if row is not None else "inserted"
+
     # ------------------------------------------------------------------ queries
 
-    def list_conversations(self) -> List[sqlite3.Row]:
+    def list_conversations(self, project_id: Optional[str] = None) -> List[sqlite3.Row]:
         with self._lock:
-            cursor = self.conn.execute(
-                """
-                SELECT conversation_id, title, create_time, update_time
+            sql = """
+                SELECT conversation_id, project_id, title, create_time, update_time
                 FROM conversations
-                ORDER BY COALESCE(update_time, create_time, 0) DESC
-                """
-            )
+            """
+            params: Tuple[Any, ...] = ()
+            if project_id:
+                sql += " WHERE project_id = ?"
+                params = (project_id,)
+            sql += " ORDER BY COALESCE(update_time, create_time, 0) DESC"
+            cursor = self.conn.execute(sql, params)
             return list(cursor.fetchall())
 
-    def search_conversations(self, query: str) -> List[sqlite3.Row]:
+    def search_conversations(self, query: str, project_id: Optional[str] = None) -> List[sqlite3.Row]:
         pattern = f"%{query.lower()}%"
         with self._lock:
-            cursor = self.conn.execute(
-                """
-                SELECT conversation_id, title, create_time, update_time
+            sql = """
+                SELECT conversation_id, project_id, title, create_time, update_time
                 FROM conversations
-                WHERE LOWER(COALESCE(title, '')) LIKE ?
-                   OR EXISTS (
+                WHERE (
+                    LOWER(COALESCE(title, '')) LIKE ?
+                    OR EXISTS (
                         SELECT 1 FROM messages
                         WHERE messages.conversation_id = conversations.conversation_id
                           AND LOWER(COALESCE(messages.text_content, '')) LIKE ?
                     )
+                )
+            """
+            params: List[Any] = [pattern, pattern]
+            if project_id:
+                sql += " AND project_id = ?"
+                params.append(project_id)
+            sql += " ORDER BY COALESCE(update_time, create_time, 0) DESC"
+            cursor = self.conn.execute(sql, tuple(params))
+            return list(cursor.fetchall())
+
+    def list_projects(self) -> List[sqlite3.Row]:
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT project_id, name, description, create_time, update_time
+                FROM projects
                 ORDER BY COALESCE(update_time, create_time, 0) DESC
-                """,
-                (pattern, pattern),
+                """
             )
             return list(cursor.fetchall())
 
@@ -344,6 +534,9 @@ def _extract_message_text(message: Dict[str, Any]) -> str:
     content payloads (text, code, execution output, attachments, etc.).
     """
     content = message.get("content") or {}
+    content_type = content.get("content_type")
+    if isinstance(content_type, str) and content_type.lower() in NON_SEARCHABLE_CONTENT_TYPES:
+        return ""
     segments: List[str] = []
 
     parts = content.get("parts")
@@ -387,3 +580,23 @@ def _render_part(part: Any) -> str:
         except TypeError:
             return str(part)
     return str(part)
+
+
+def _extract_project_id(conversation: Dict[str, Any]) -> Optional[str]:
+    project_id = conversation.get("project_id") or conversation.get("projectId")
+    if project_id:
+        return str(project_id)
+
+    project_data = conversation.get("project")
+    if isinstance(project_data, dict):
+        candidate = project_data.get("id") or project_data.get("project_id")
+        if candidate:
+            return str(candidate)
+
+    metadata = conversation.get("metadata")
+    if isinstance(metadata, dict):
+        candidate = metadata.get("project_id") or metadata.get("projectId")
+        if candidate:
+            return str(candidate)
+
+    return None
