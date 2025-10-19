@@ -1,0 +1,24 @@
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Local data files
+chat_history.db
+conversations.json
+
+# IDE settings
+.idea/
+.vscode/
