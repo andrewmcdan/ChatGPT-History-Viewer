@@ -16,7 +16,7 @@ dist/
 *.egg-info/
 
 # Local data files
-chat_history.db
+chat_history.db*
 conversations.json
 
 # IDE settings
