@@ -1,12 +1,27 @@
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from database import ChatHistoryDatabase
+
+
+META_CONTENT_TYPES = {
+    "thoughts",
+    "reasoning_recap",
+    "user_editable_context",
+    "tether_quote",
+    "computer_output",
+    "execution_output",
+    "system_error",
+    "tether_browsing_display",
+}
+
+INLINE_PATTERN = re.compile(r"(\*\*.+?\*\*|__.+?__|`.+?`|\*[^*]+\*|_[^_]+_)")
 
 
 APP_TITLE = "ChatGPT History Viewer"
@@ -23,6 +38,7 @@ class ChatHistoryViewer(tk.Tk):
         self.conversation_rows: List[dict] = []
 
         self.search_var = tk.StringVar()
+        self.show_meta_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
         self.conversation_title_var = tk.StringVar(value="Select a conversation to view its messages.")
 
@@ -65,6 +81,12 @@ class ChatHistoryViewer(tk.Tk):
 
         ttk.Button(search_frame, text="Search", command=self.on_search).grid(row=0, column=2, padx=(6, 0))
         ttk.Button(search_frame, text="Clear", command=self.on_clear_search).grid(row=0, column=3, padx=(6, 0))
+        ttk.Checkbutton(
+            search_frame,
+            text="Show system/tool entries",
+            variable=self.show_meta_var,
+            command=self.on_toggle_meta,
+        ).grid(row=0, column=4, padx=(12, 0))
 
     def _build_paned_layout(self) -> None:
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -105,7 +127,7 @@ class ChatHistoryViewer(tk.Tk):
             right_frame,
             wrap="word",
             state="disabled",
-            font=("Consolas", 10),
+            font=("Segoe UI", 11),
             undo=False,
         )
         self.conversation_text.grid(row=1, column=0, sticky="nsew")
@@ -123,14 +145,46 @@ class ChatHistoryViewer(tk.Tk):
         status.grid(row=2, column=0, sticky="ew")
 
     def _configure_text_tags(self) -> None:
-        self.conversation_text.tag_configure("role_user", foreground="#1c7ed6", font=("Consolas", 10, "bold"))
-        self.conversation_text.tag_configure("role_assistant", foreground="#2f9e44", font=("Consolas", 10, "bold"))
-        self.conversation_text.tag_configure("role_system", foreground="#f08c00", font=("Consolas", 10, "bold"))
-        self.conversation_text.tag_configure("role_tool", foreground="#862e9c", font=("Consolas", 10, "bold"))
-        self.conversation_text.tag_configure("role_other", foreground="#495057", font=("Consolas", 10, "bold"))
+        self.conversation_text.tag_configure("role_user", foreground="#1c7ed6", font=("Segoe UI", 11, "bold"))
+        self.conversation_text.tag_configure("role_assistant", foreground="#2f9e44", font=("Segoe UI", 11, "bold"))
+        self.conversation_text.tag_configure("role_system", foreground="#f08c00", font=("Segoe UI", 11, "bold"))
+        self.conversation_text.tag_configure("role_tool", foreground="#862e9c", font=("Segoe UI", 11, "bold"))
+        self.conversation_text.tag_configure("role_other", foreground="#495057", font=("Segoe UI", 11, "bold"))
 
-        self.conversation_text.tag_configure("body_text", foreground="#212529", font=("Consolas", 10))
-        self.conversation_text.tag_configure("timestamp", foreground="#868e96", font=("Consolas", 9, "italic"))
+        self.conversation_text.tag_configure("body_text", foreground="#212529", font=("Segoe UI", 10), spacing3=8)
+        self.conversation_text.tag_configure("timestamp", foreground="#868e96", font=("Segoe UI", 9, "italic"))
+        self.conversation_text.tag_configure("meta_header", foreground="#868e96")
+        self.conversation_text.tag_configure("meta_body", foreground="#495057", font=("Segoe UI", 10, "italic"))
+        self.conversation_text.tag_configure("meta_placeholder", foreground="#adb5bd", font=("Segoe UI", 10, "italic"))
+
+        self.conversation_text.tag_configure("md_heading1", font=("Segoe UI", 16, "bold"), spacing1=6, spacing3=6)
+        self.conversation_text.tag_configure("md_heading2", font=("Segoe UI", 14, "bold"), spacing1=6, spacing3=6)
+        self.conversation_text.tag_configure("md_heading3", font=("Segoe UI", 12, "bold"), spacing1=4, spacing3=4)
+        self.conversation_text.tag_configure("md_bold", font=("Segoe UI", 10, "bold"))
+        self.conversation_text.tag_configure("md_italic", font=("Segoe UI", 10, "italic"))
+        self.conversation_text.tag_configure("md_inline_code", font=("Consolas", 10), background="#e9ecef")
+        self.conversation_text.tag_configure(
+            "md_codeblock",
+            font=("Consolas", 10),
+            background="#f1f3f5",
+            lmargin1=20,
+            lmargin2=20,
+            spacing1=4,
+            spacing3=6,
+        )
+        self.conversation_text.tag_configure(
+            "md_blockquote",
+            font=("Segoe UI", 10, "italic"),
+            foreground="#495057",
+            lmargin1=20,
+            lmargin2=30,
+        )
+        self.conversation_text.tag_configure(
+            "md_list_item",
+            lmargin1=25,
+            lmargin2=45,
+        )
+
         self.conversation_text.tag_configure(
             "search_match",
             background="#ffe066",
@@ -189,6 +243,9 @@ class ChatHistoryViewer(tk.Tk):
         self.search_var.set("")
         self.refresh_conversation_list()
 
+    def on_toggle_meta(self) -> None:
+        self.on_conversation_selected()
+
     def on_conversation_selected(self, event: Optional[tk.Event] = None) -> None:
         selection = self.conversation_listbox.curselection()
         if not selection:
@@ -217,26 +274,87 @@ class ChatHistoryViewer(tk.Tk):
         self.conversation_text.config(state="normal")
         self.conversation_text.delete("1.0", tk.END)
 
-        if not messages:
-            self.conversation_text.insert(tk.END, "No messages to display.", ("body_text",))
-            self.conversation_text.config(state="disabled")
-            return
+        show_meta = self.show_meta_var.get()
+        render_items = []
 
         for message in messages:
             role = (message["author_role"] or "other").lower()
-            role_tag = f"role_{role}" if role in {"user", "assistant", "system", "tool"} else "role_other"
+            content_type = (message["content_type"] or "").lower()
+            text_content = (message["text_content"] or "").strip()
+            is_tool = role == "tool"
+            is_meta = is_tool or role == "system" or content_type in META_CONTENT_TYPES
 
-            timestamp = format_timestamp(message["create_time"])
+            if not show_meta:
+                if is_tool:
+                    render_items.append(
+                        {
+                            "role": role,
+                            "timestamp": message["create_time"],
+                            "body": "[Tool entry omitted]",
+                            "placeholder": True,
+                            "meta": True,
+                            "content_type": content_type,
+                        }
+                    )
+                    continue
+                if is_meta:
+                    continue
+
+            if not text_content:
+                # Skip empty fillers entirely.
+                continue
+
+            body_text = text_content
+            if content_type == "code" and body_text:
+                body_text = f"```\n{body_text}\n```"
+
+            render_items.append(
+                {
+                    "role": role,
+                    "timestamp": message["create_time"],
+                    "body": body_text,
+                    "placeholder": False,
+                    "meta": is_meta,
+                    "content_type": content_type,
+                }
+            )
+
+        if not render_items:
+            message_text = "No messages to display with the current filters."
+            self.conversation_text.insert(tk.END, message_text, ("body_text",))
+            self.conversation_text.config(state="disabled")
+            return
+
+        for item in render_items:
+            role = item["role"]
+            role_tag = f"role_{role}" if role in {"user", "assistant", "system", "tool"} else "role_other"
+            header_tags = (role_tag,)
+            if item["meta"]:
+                header_tags = self._combine_tags(header_tags, ("meta_header",))
+
+            timestamp = format_timestamp(item["timestamp"])
             header_line = role.capitalize()
+            if show_meta and item["meta"] and item["content_type"]:
+                header_line += f" ({item['content_type']})"
             if timestamp:
                 header_line += f"  —  {timestamp}"
 
-            self.conversation_text.insert(tk.END, header_line + "\n", (role_tag,))
+            self.conversation_text.insert(tk.END, header_line + "\n", header_tags)
 
-            body = (message["text_content"] or "").strip()
-            if not body:
-                body = "[no textual content]"
-            self.conversation_text.insert(tk.END, body + "\n\n", ("body_text",))
+            if item["placeholder"]:
+                self.conversation_text.insert(
+                    tk.END,
+                    item["body"] + "\n\n",
+                    ("body_text", "meta_placeholder"),
+                )
+                continue
+
+            base_tags: Tuple[str, ...] = ("body_text",)
+            if show_meta and item["meta"]:
+                base_tags = self._combine_tags(base_tags, ("meta_body",))
+
+            self._insert_markdown(item["body"], base_tags)
+            self.conversation_text.insert(tk.END, "\n")
 
         self._apply_search_highlight()
         self.conversation_text.config(state="disabled")
@@ -255,6 +373,111 @@ class ChatHistoryViewer(tk.Tk):
             end = f"{pos}+{len(query)}c"
             self.conversation_text.tag_add("search_match", pos, end)
             start = end
+
+    # --------------------------------------------------------- markdown render
+
+    @staticmethod
+    def _combine_tags(*tag_groups: Tuple[str, ...]) -> Tuple[str, ...]:
+        combined: List[str] = []
+        for group in tag_groups:
+            for tag in group:
+                if tag not in combined:
+                    combined.append(tag)
+        return tuple(combined)
+
+    def _insert_markdown(self, text: str, base_tags: Tuple[str, ...]) -> None:
+        lines = text.splitlines()
+        if not lines:
+            self.conversation_text.insert(tk.END, "\n", base_tags)
+            return
+
+        in_code_block = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code_block:
+                    in_code_block = False
+                    self.conversation_text.insert(tk.END, "\n", base_tags)
+                else:
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_tags = self._combine_tags(base_tags, ("md_codeblock",))
+                self.conversation_text.insert(tk.END, line + "\n", code_tags)
+                continue
+
+            if not stripped:
+                self.conversation_text.insert(tk.END, "\n", base_tags)
+                continue
+
+            if stripped.startswith("# "):
+                heading_tags = ("md_heading1",)
+                self.conversation_text.insert(tk.END, stripped[2:].strip() + "\n", heading_tags)
+                continue
+            if stripped.startswith("## "):
+                heading_tags = ("md_heading2",)
+                self.conversation_text.insert(tk.END, stripped[3:].strip() + "\n", heading_tags)
+                continue
+            if stripped.startswith("### "):
+                heading_tags = ("md_heading3",)
+                self.conversation_text.insert(tk.END, stripped[4:].strip() + "\n", heading_tags)
+                continue
+            if stripped.startswith(("> ", ">>")):
+                quote_tags = self._combine_tags(base_tags, ("md_blockquote",))
+                quote_text = stripped.lstrip(">").strip()
+                self._insert_inline_segments(quote_text, quote_tags)
+                self.conversation_text.insert(tk.END, "\n", quote_tags)
+                continue
+            if stripped.startswith(("- ", "* ")):
+                bullet_tags = self._combine_tags(base_tags, ("md_list_item",))
+                bullet_text = stripped[2:].strip()
+                self.conversation_text.insert(tk.END, "• ", bullet_tags)
+                self._insert_inline_segments(bullet_text, bullet_tags)
+                self.conversation_text.insert(tk.END, "\n", bullet_tags)
+                continue
+
+            paragraph_tags = base_tags
+            self._insert_inline_segments(line, paragraph_tags)
+            self.conversation_text.insert(tk.END, "\n", paragraph_tags)
+
+    def _insert_inline_segments(self, text: str, base_tags: Tuple[str, ...]) -> None:
+        for segment_text, segment_tags in self._split_inline_segments(text, base_tags):
+            self.conversation_text.insert(tk.END, segment_text, segment_tags)
+
+    def _split_inline_segments(
+        self,
+        text: str,
+        base_tags: Tuple[str, ...],
+    ) -> List[Tuple[str, Tuple[str, ...]]]:
+        segments: List[Tuple[str, Tuple[str, ...]]] = []
+        index = 0
+
+        for match in INLINE_PATTERN.finditer(text):
+            start, end = match.span()
+            if start > index:
+                segments.append((text[index:start], base_tags))
+
+            token = match.group(0)
+            if token.startswith("**") and token.endswith("**"):
+                segments.append((token[2:-2], self._combine_tags(base_tags, ("md_bold",))))
+            elif token.startswith("__") and token.endswith("__"):
+                segments.append((token[2:-2], self._combine_tags(base_tags, ("md_bold",))))
+            elif token.startswith("`") and token.endswith("`"):
+                segments.append((token[1:-1], self._combine_tags(base_tags, ("md_inline_code",))))
+            elif token.startswith("*") and token.endswith("*"):
+                segments.append((token[1:-1], self._combine_tags(base_tags, ("md_italic",))))
+            elif token.startswith("_") and token.endswith("_"):
+                segments.append((token[1:-1], self._combine_tags(base_tags, ("md_italic",))))
+            else:
+                segments.append((token, base_tags))
+
+            index = end
+
+        if index < len(text):
+            segments.append((text[index:], base_tags))
+
+        return segments
 
     # ------------------------------------------------------------ file actions
 
