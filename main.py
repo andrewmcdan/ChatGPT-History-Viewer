@@ -1,5 +1,6 @@
 import re
 import threading
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -8,6 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from database import ChatHistoryDatabase
+from embeddings import EmbeddingError, OpenAIEmbedder
 
 
 META_CONTENT_TYPES = {
@@ -27,6 +29,37 @@ INLINE_PATTERN = re.compile(r"(\*\*.+?\*\*|__.+?__|`.+?`|\*[^*]+\*|_[^_]+_)")
 APP_TITLE = "ChatGPT History Viewer"
 DEFAULT_DB_PATH = Path("chat_history.db")
 ALL_PROJECTS_OPTION = "All projects"
+DOTENV_PATH = Path(__file__).with_name(".env")
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and value[0] not in ("'", '"'):
+            comment_index = value.find(" #")
+            if comment_index != -1:
+                value = value[:comment_index].rstrip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 class ChatHistoryViewer(tk.Tk):
@@ -39,6 +72,7 @@ class ChatHistoryViewer(tk.Tk):
         self.conversation_rows: List[dict] = []
 
         self.search_var = tk.StringVar()
+        self.semantic_search_var = tk.BooleanVar(value=False)
         self.show_meta_var = tk.BooleanVar(value=False)
         self.project_filter_var = tk.StringVar(value=ALL_PROJECTS_OPTION)
         self.status_var = tk.StringVar(value="Ready")
@@ -46,6 +80,7 @@ class ChatHistoryViewer(tk.Tk):
         self.project_filter_map: Dict[str, Optional[str]] = {ALL_PROJECTS_OPTION: None}
         self.project_lookup: Dict[str, str] = {}
         self.projects: List[dict] = []
+        self._embedder: Optional[OpenAIEmbedder] = None
 
         self._build_ui()
         self._bind_events()
@@ -74,6 +109,11 @@ class ChatHistoryViewer(tk.Tk):
         file_menu.add_command(label="Exit", command=self.destroy)
 
         menubar.add_cascade(label="File", menu=file_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=False)
+        tools_menu.add_command(label="Build embeddings...", command=self._build_embeddings)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
         self.config(menu=menubar)
 
     def _build_search_bar(self) -> None:
@@ -90,11 +130,17 @@ class ChatHistoryViewer(tk.Tk):
         ttk.Button(search_frame, text="Clear", command=self.on_clear_search).grid(row=0, column=3, padx=(6, 0))
         ttk.Checkbutton(
             search_frame,
+            text="Semantic",
+            variable=self.semantic_search_var,
+            command=self.on_search_mode_changed,
+        ).grid(row=0, column=4, padx=(12, 0))
+        ttk.Checkbutton(
+            search_frame,
             text="Show system/tool entries",
             variable=self.show_meta_var,
             command=self.on_toggle_meta,
-        ).grid(row=0, column=4, padx=(12, 0))
-        ttk.Label(search_frame, text="Project:").grid(row=0, column=5, padx=(12, 6))
+        ).grid(row=0, column=5, padx=(12, 0))
+        ttk.Label(search_frame, text="Project:").grid(row=0, column=6, padx=(12, 6))
         self.project_filter = ttk.Combobox(
             search_frame,
             state="readonly",
@@ -102,7 +148,7 @@ class ChatHistoryViewer(tk.Tk):
             values=[ALL_PROJECTS_OPTION],
             width=28,
         )
-        self.project_filter.grid(row=0, column=6, sticky="ew")
+        self.project_filter.grid(row=0, column=7, sticky="ew")
         self.project_filter.current(0)
         self.project_filter.bind("<<ComboboxSelected>>", self.on_project_filter_changed)
 
@@ -278,8 +324,17 @@ class ChatHistoryViewer(tk.Tk):
     def refresh_conversation_list(self, query: Optional[str] = None) -> None:
         project_id = self._current_project_id()
         if query:
-            rows = self.db.search_conversations(query, project_id=project_id)
-            status_message = f"Search results: {len(rows)} conversation(s) matching '{query}'."
+            if self.semantic_search_var.get():
+                rows = self._semantic_search(query, project_id)
+                if self.semantic_search_var.get():
+                    status_message = (
+                        f"Semantic search results: {len(rows)} conversation(s) matching '{query}'."
+                    )
+                else:
+                    status_message = f"Search results: {len(rows)} conversation(s) matching '{query}'."
+            else:
+                rows = self.db.search_conversations(query, project_id=project_id)
+                status_message = f"Search results: {len(rows)} conversation(s) matching '{query}'."
         else:
             rows = self.db.list_conversations(project_id=project_id)
             status_message = f"Loaded {len(rows)} conversations."
@@ -323,6 +378,23 @@ class ChatHistoryViewer(tk.Tk):
         else:
             self.clear_conversation_view()
 
+    def _get_embedder(self) -> OpenAIEmbedder:
+        if self._embedder is None:
+            self._embedder = OpenAIEmbedder()
+        return self._embedder
+
+    def _semantic_search(self, query: str, project_id: Optional[str]) -> List:
+        try:
+            embedder = self._get_embedder()
+            return self.db.semantic_search_conversations(query, embedder, project_id=project_id)
+        except EmbeddingError as exc:
+            messagebox.showerror("Semantic search unavailable", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Semantic search failed", str(exc))
+
+        self.semantic_search_var.set(False)
+        return self.db.search_conversations(query, project_id=project_id)
+
     def on_search(self, event: Optional[tk.Event] = None) -> None:
         query = self.search_var.get().strip()
         if query:
@@ -333,6 +405,10 @@ class ChatHistoryViewer(tk.Tk):
     def on_clear_search(self) -> None:
         self.search_var.set("")
         self.refresh_conversation_list()
+
+    def on_search_mode_changed(self) -> None:
+        query = self.search_var.get().strip()
+        self.refresh_conversation_list(query if query else None)
 
     def on_project_filter_changed(self, event: Optional[tk.Event] = None) -> None:
         selection = self.project_filter_var.get()
@@ -613,7 +689,7 @@ class ChatHistoryViewer(tk.Tk):
 
                 stats = self.db.import_conversations_json(path, progress_callback=progress)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._handle_import_error(path, exc))
+                self.after(0, lambda exc=exc, path=path: self._handle_import_error(path, exc))
             else:
                 self.after(0, lambda: self._handle_import_success(path, stats))
 
@@ -646,9 +722,36 @@ class ChatHistoryViewer(tk.Tk):
 
                 stats = self.db.import_projects_json(path, progress_callback=progress)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._handle_project_import_error(path, exc))
+                self.after(0, lambda exc=exc, path=path: self._handle_project_import_error(path, exc))
             else:
                 self.after(0, lambda: self._handle_project_import_success(path, stats))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_embeddings(self) -> None:
+        try:
+            embedder = self._get_embedder()
+        except EmbeddingError as exc:
+            messagebox.showerror("Embeddings unavailable", str(exc))
+            return
+
+        self.status_var.set("Building embeddings...")
+
+        def worker() -> None:
+            try:
+                def progress(current: int, total: int) -> None:
+                    self.after(
+                        0,
+                        lambda: self.status_var.set(
+                            f"Embedding messages: {current}/{total}..."
+                        ),
+                    )
+
+                stats = self.db.build_message_embeddings(embedder, progress_callback=progress)
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda exc=exc: self._handle_embedding_error(exc))
+            else:
+                self.after(0, lambda: self._handle_embedding_success(stats))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -680,6 +783,23 @@ class ChatHistoryViewer(tk.Tk):
         messagebox.showerror("Project import failed", f"Could not import {path}.\n\n{error}")
         self.status_var.set("Project import failed.")
 
+    def _handle_embedding_success(self, stats: dict) -> None:
+        embedded = stats.get("embedded", 0)
+        total = stats.get("total", 0)
+        skipped = stats.get("skipped", 0)
+
+        if total == 0:
+            self.status_var.set("Embeddings are already up to date.")
+            return
+
+        self.status_var.set(f"Embedding complete: {embedded} embedded, {skipped} skipped.")
+        if self.semantic_search_var.get() and self.search_var.get().strip():
+            self.refresh_conversation_list(self.search_var.get().strip())
+
+    def _handle_embedding_error(self, error: Exception) -> None:
+        messagebox.showerror("Embedding failed", str(error))
+        self.status_var.set("Embedding failed.")
+
     # ---------------------------------------------------------------- cleanup
 
     def destroy(self) -> None:
@@ -698,6 +818,7 @@ def format_timestamp(timestamp: Optional[float]) -> str:
 
 
 def main() -> None:
+    _load_dotenv(DOTENV_PATH)
     app = ChatHistoryViewer(DEFAULT_DB_PATH)
     app.mainloop()
 

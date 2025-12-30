@@ -1,6 +1,9 @@
 import json
+import os
 import sqlite3
 import threading
+import sys
+from array import array
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -10,6 +13,15 @@ MessageTuple = Tuple[str, Optional[str], Dict[str, Any]]
 NON_SEARCHABLE_CONTENT_TYPES = {
     "user_editable_context",
 }
+
+EMBEDDING_METADATA_TABLE = "embedding_metadata"
+EMBEDDING_MAP_TABLE = "message_embedding_map"
+EMBEDDING_VECTOR_TABLE = "message_embeddings"
+VECTOR_BACKEND_ENV = "CHAT_HISTORY_VECTOR_BACKEND"
+VECTOR_EXTENSION_ENV = "CHAT_HISTORY_VECTOR_EXTENSION"
+DEFAULT_VECTOR_BACKEND = "vec"
+EMBEDDING_MAX_CHARS_ENV = "CHAT_HISTORY_EMBEDDING_MAX_CHARS"
+DEFAULT_EMBEDDING_MAX_CHARS = 8000
 
 
 class ChatHistoryDatabase:
@@ -26,6 +38,7 @@ class ChatHistoryDatabase:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self._vector_extension_loaded = False
         self._ensure_schema()
         self._purge_non_searchable_text()
 
@@ -104,6 +117,36 @@ class ChatHistoryDatabase:
                 ON messages(text_content)
                 """
             )
+            self.conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {EMBEDDING_METADATA_TABLE} (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {EMBEDDING_MAP_TABLE} (
+                    embedding_id INTEGER PRIMARY KEY,
+                    message_id TEXT NOT NULL UNIQUE,
+                    conversation_id TEXT NOT NULL,
+                    create_time REAL,
+                    FOREIGN KEY (message_id)
+                        REFERENCES messages(message_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (conversation_id)
+                        REFERENCES conversations(conversation_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            self.conn.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_embedding_map_conversation
+                ON {EMBEDDING_MAP_TABLE}(conversation_id)
+                """
+            )
             self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -126,6 +169,138 @@ class ChatHistoryDatabase:
                 """,
                 tuple(NON_SEARCHABLE_CONTENT_TYPES),
             )
+
+    def _vector_backend(self) -> str:
+        backend = os.environ.get(VECTOR_BACKEND_ENV, DEFAULT_VECTOR_BACKEND).strip().lower()
+        if backend not in {"vec", "vss"}:
+            backend = DEFAULT_VECTOR_BACKEND
+        return backend
+
+    def _load_vector_extension(self) -> None:
+        if self._vector_extension_loaded:
+            return
+        extension_path = os.environ.get(VECTOR_EXTENSION_ENV)
+        if not extension_path:
+            raise RuntimeError(
+                f"Vector extension not configured. Set {VECTOR_EXTENSION_ENV} to the extension path."
+            )
+        paths = [item.strip() for item in extension_path.split(";") if item.strip()]
+        if not paths:
+            raise RuntimeError(
+                f"Vector extension not configured. Set {VECTOR_EXTENSION_ENV} to the extension path."
+            )
+        self.conn.enable_load_extension(True)
+        try:
+            for path in paths:
+                self.conn.load_extension(path)
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(f"Failed to load vector extension: {exc}") from exc
+        self._vector_extension_loaded = True
+
+    def _vector_table_exists(self) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (EMBEDDING_VECTOR_TABLE,),
+        ).fetchone()
+        return row is not None
+
+    def _get_embedding_metadata(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            f"SELECT value FROM {EMBEDDING_METADATA_TABLE} WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["value"]
+
+    def _set_embedding_metadata(self, key: str, value: str) -> None:
+        self.conn.execute(
+            f"""
+            INSERT INTO {EMBEDDING_METADATA_TABLE} (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    def _ensure_vector_table(self, embedding_dim: int, embedding_model: Optional[str]) -> None:
+        if embedding_dim <= 0:
+            raise ValueError("Embedding dimension must be positive.")
+
+        backend = self._vector_backend()
+        self._load_vector_extension()
+
+        stored_backend = self._get_embedding_metadata("embedding_backend")
+        stored_dim = self._get_embedding_metadata("embedding_dim")
+        stored_model = self._get_embedding_metadata("embedding_model")
+
+        if stored_backend and stored_backend != backend:
+            raise RuntimeError(
+                f"Embedding backend mismatch (db={stored_backend}, env={backend})."
+            )
+        if stored_dim and int(stored_dim) != embedding_dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch (db={stored_dim}, env={embedding_dim})."
+            )
+        if stored_model and embedding_model and stored_model != embedding_model:
+            raise RuntimeError(
+                f"Embedding model mismatch (db={stored_model}, env={embedding_model})."
+            )
+
+        if not self._vector_table_exists():
+            if backend == "vss":
+                create_sql = (
+                    f"CREATE VIRTUAL TABLE IF NOT EXISTS {EMBEDDING_VECTOR_TABLE} "
+                    f"USING vss0(embedding({embedding_dim}))"
+                )
+            else:
+                create_sql = (
+                    f"CREATE VIRTUAL TABLE IF NOT EXISTS {EMBEDDING_VECTOR_TABLE} "
+                    f"USING vec0(embedding float[{embedding_dim}])"
+                )
+            with self.conn:
+                self.conn.execute(create_sql)
+                self._set_embedding_metadata("embedding_backend", backend)
+                self._set_embedding_metadata("embedding_dim", str(embedding_dim))
+                if embedding_model:
+                    self._set_embedding_metadata("embedding_model", embedding_model)
+        else:
+            with self.conn:
+                self._set_embedding_metadata("embedding_backend", backend)
+                self._set_embedding_metadata("embedding_dim", str(embedding_dim))
+                if embedding_model:
+                    self._set_embedding_metadata("embedding_model", embedding_model)
+
+    def _delete_embeddings_for_conversation(self, conversation_id: str) -> None:
+        if self._vector_extension_loaded and self._vector_table_exists():
+            self.conn.execute(
+                f"""
+                DELETE FROM {EMBEDDING_VECTOR_TABLE}
+                WHERE rowid IN (
+                    SELECT embedding_id
+                    FROM {EMBEDDING_MAP_TABLE}
+                    WHERE conversation_id = ?
+                )
+                """,
+                (conversation_id,),
+            )
+        self.conn.execute(
+            f"DELETE FROM {EMBEDDING_MAP_TABLE} WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+
+    def _next_embedding_id(self) -> int:
+        row = self.conn.execute(
+            f"SELECT COALESCE(MAX(embedding_id), 0) + 1 AS next_id FROM {EMBEDDING_MAP_TABLE}"
+        ).fetchone()
+        next_id = int(row["next_id"]) if row is not None else 1
+        if self._vector_extension_loaded and self._vector_table_exists():
+            row = self.conn.execute(
+                f"SELECT COALESCE(MAX(rowid), 0) + 1 AS next_id FROM {EMBEDDING_VECTOR_TABLE}"
+            ).fetchone()
+            if row is not None:
+                next_id = max(next_id, int(row["next_id"]))
+        return next_id
 
     # ------------------------------------------------------------------ import
 
@@ -280,6 +455,7 @@ class ChatHistoryDatabase:
                 )
 
                 # Replace messages for this conversation.
+                self._delete_embeddings_for_conversation(conversation_id)
                 self.conn.execute(
                     "DELETE FROM messages WHERE conversation_id = ?",
                     (conversation_id,),
@@ -399,6 +575,196 @@ class ChatHistoryDatabase:
                 )
 
         return "updated" if row is not None else "inserted"
+
+    # --------------------------------------------------------------- embeddings
+
+    def build_message_embeddings(
+        self,
+        embedder: Any,
+        batch_size: int = 64,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, int]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT m.message_id, m.conversation_id, m.create_time, m.text_content
+                FROM messages m
+                LEFT JOIN {EMBEDDING_MAP_TABLE} map
+                    ON map.message_id = m.message_id
+                WHERE map.message_id IS NULL
+                  AND m.text_content IS NOT NULL
+                  AND m.text_content <> ''
+                ORDER BY m.conversation_id, m.position
+                """
+            ).fetchall()
+
+        total = len(rows)
+        if total == 0:
+            return {"embedded": 0, "total": 0, "skipped": 0}
+
+        with self._lock:
+            self._load_vector_extension()
+
+        max_chars = _embedding_max_chars()
+        embedded = 0
+        embedding_dim: Optional[int] = None
+        embedding_model = getattr(embedder, "model", None)
+        next_id: Optional[int] = None
+
+        for batch in _chunked(rows, batch_size):
+            embeddings_by_message: Dict[str, List[float]] = {}
+            short_rows: List[Any] = []
+            short_texts: List[str] = []
+
+            for row in batch:
+                text = row["text_content"] or ""
+                if not text.strip():
+                    continue
+                if max_chars and len(text) > max_chars:
+                    embedding = _embed_text_with_chunking(embedder, text, max_chars, batch_size)
+                    embeddings_by_message[row["message_id"]] = embedding
+                else:
+                    short_rows.append(row)
+                    short_texts.append(text)
+
+            if short_texts:
+                embeddings = embedder.embed_texts(short_texts)
+                if len(embeddings) != len(short_rows):
+                    raise RuntimeError("Embedding response count mismatch.")
+                for row, embedding in zip(short_rows, embeddings):
+                    embeddings_by_message[row["message_id"]] = embedding
+
+            if not embeddings_by_message:
+                continue
+
+            if embedding_dim is None:
+                embedding_dim = len(next(iter(embeddings_by_message.values())))
+                with self._lock:
+                    self._ensure_vector_table(embedding_dim, embedding_model)
+                    next_id = self._next_embedding_id()
+
+            if embedding_dim is None or next_id is None:
+                raise RuntimeError("Embedding index failed to initialize.")
+
+            for embedding in embeddings_by_message.values():
+                if len(embedding) != embedding_dim:
+                    raise RuntimeError("Embedding dimension mismatch in batch.")
+
+            with self._lock, self.conn:
+                for row in batch:
+                    embedding = embeddings_by_message.get(row["message_id"])
+                    if embedding is None:
+                        continue
+                    vector_blob = _serialize_embedding(embedding)
+                    self.conn.execute(
+                        f"""
+                        INSERT INTO {EMBEDDING_VECTOR_TABLE} (rowid, embedding)
+                        VALUES (?, ?)
+                        """,
+                        (next_id, vector_blob),
+                    )
+                    self.conn.execute(
+                        f"""
+                        INSERT INTO {EMBEDDING_MAP_TABLE} (
+                            embedding_id, message_id, conversation_id, create_time
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            next_id,
+                            row["message_id"],
+                            row["conversation_id"],
+                            row["create_time"],
+                        ),
+                    )
+                    next_id += 1
+
+            embedded += len(embeddings_by_message)
+            if progress_callback:
+                progress_callback(embedded, total)
+
+        return {"embedded": embedded, "total": total, "skipped": total - embedded}
+
+    def semantic_search_conversations(
+        self,
+        query: str,
+        embedder: Any,
+        project_id: Optional[str] = None,
+        limit: int = 200,
+        message_limit: int = 200,
+    ) -> List[sqlite3.Row]:
+        if not query:
+            return self.list_conversations(project_id=project_id)
+
+        if message_limit <= 0:
+            raise ValueError("message_limit must be positive.")
+        if limit <= 0:
+            raise ValueError("limit must be positive.")
+
+        with self._lock:
+            self._load_vector_extension()
+
+        max_chars = _embedding_max_chars()
+        if max_chars and len(query) > max_chars:
+            embedding = _embed_text_with_chunking(embedder, query, max_chars, 32)
+        else:
+            embeddings = embedder.embed_texts([query])
+            if not embeddings:
+                return []
+            embedding = embeddings[0]
+        embedding_dim = len(embedding)
+        embedding_model = getattr(embedder, "model", None)
+        vector_blob = _serialize_embedding(embedding)
+        backend = self._vector_backend()
+
+        with self._lock:
+            self._ensure_vector_table(embedding_dim, embedding_model)
+            if not self._vector_table_exists():
+                raise RuntimeError("Embedding index not initialized. Build embeddings first.")
+
+            total_embeddings = self.conn.execute(
+                f"SELECT COUNT(*) AS total FROM {EMBEDDING_MAP_TABLE}"
+            ).fetchone()["total"]
+            if total_embeddings == 0:
+                raise RuntimeError("No embeddings found. Build embeddings first.")
+
+            match_clause = "vss_search(v.embedding, ?)" if backend == "vss" else "v.embedding MATCH ?"
+            sql = f"""
+                WITH matches AS (
+                    SELECT map.conversation_id, v.distance
+                    FROM {EMBEDDING_VECTOR_TABLE} v
+                    JOIN {EMBEDDING_MAP_TABLE} map
+                        ON map.embedding_id = v.rowid
+                    WHERE {match_clause}
+                    ORDER BY v.distance
+                    LIMIT ?
+                )
+                SELECT c.conversation_id,
+                       c.project_id,
+                       c.title,
+                       c.create_time,
+                       c.update_time,
+                       MIN(matches.distance) AS best_distance
+                FROM matches
+                JOIN conversations c
+                    ON c.conversation_id = matches.conversation_id
+            """
+            params: List[Any] = [vector_blob, message_limit]
+            if project_id:
+                sql += " WHERE c.project_id = ?"
+                params.append(project_id)
+            sql += """
+                GROUP BY c.conversation_id
+                ORDER BY best_distance ASC, COALESCE(c.update_time, c.create_time, 0) DESC
+                LIMIT ?
+            """
+            params.append(limit)
+
+            cursor = self.conn.execute(sql, tuple(params))
+            return list(cursor.fetchall())
 
     # ------------------------------------------------------------------ queries
 
@@ -600,3 +966,108 @@ def _extract_project_id(conversation: Dict[str, Any]) -> Optional[str]:
             return str(candidate)
 
     return None
+
+
+def _serialize_embedding(vector: List[float]) -> bytes:
+    blob = array("f", vector)
+    if sys.byteorder != "little":
+        blob.byteswap()
+    return blob.tobytes()
+
+
+def _chunked(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def _embedding_max_chars() -> int:
+    raw_value = os.environ.get(EMBEDDING_MAX_CHARS_ENV)
+    if not raw_value:
+        return DEFAULT_EMBEDDING_MAX_CHARS
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return DEFAULT_EMBEDDING_MAX_CHARS
+    return parsed if parsed > 0 else 0
+
+
+def _chunk_text(text: str, max_chars: int) -> List[str]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [part for part in text.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return [text[:max_chars]]
+
+    chunks: List[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if not current:
+            candidate = paragraph
+        else:
+            candidate = f"{current}\n\n{paragraph}"
+
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(paragraph) <= max_chars:
+            current = paragraph
+            continue
+
+        for start in range(0, len(paragraph), max_chars):
+            chunk = paragraph[start : start + max_chars]
+            if chunk.strip():
+                chunks.append(chunk)
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _embed_text_with_chunking(
+    embedder: Any,
+    text: str,
+    max_chars: int,
+    batch_size: int,
+) -> List[float]:
+    chunks = _chunk_text(text, max_chars)
+    if not chunks:
+        raise RuntimeError("No text chunks to embed.")
+
+    if len(chunks) == 1:
+        embeddings = embedder.embed_texts(chunks)
+        if not embeddings:
+            raise RuntimeError("Embedding response was empty.")
+        return embeddings[0]
+
+    embeddings: List[List[float]] = []
+    for chunk_batch in _chunked(chunks, batch_size):
+        embeddings.extend(embedder.embed_texts(chunk_batch))
+
+    if not embeddings:
+        raise RuntimeError("Embedding response was empty.")
+
+    return _average_embeddings(embeddings)
+
+
+def _average_embeddings(embeddings: List[List[float]]) -> List[float]:
+    if not embeddings:
+        raise RuntimeError("No embeddings to average.")
+
+    dimension = len(embeddings[0])
+    totals = [0.0] * dimension
+    for embedding in embeddings:
+        if len(embedding) != dimension:
+            raise RuntimeError("Embedding dimension mismatch while averaging.")
+        for index, value in enumerate(embedding):
+            totals[index] += float(value)
+
+    scale = 1.0 / len(embeddings)
+    return [value * scale for value in totals]

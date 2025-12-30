@@ -10,6 +10,7 @@ ChatGPT History Viewer is a desktop utility for browsing exported ChatGPT conver
 - Conversation list sorted by most recent activity with timestamps.
 - Full message viewer with role-aware styling (user/assistant/system/tool).
 - Global text search across titles and message bodies with inline highlighting.
+- Optional semantic search powered by embeddings and a SQLite vector extension.
 - Attachment and code payloads flattened into readable text for searching.
 
 ## Requirements
@@ -33,6 +34,22 @@ ChatGPT History Viewer is a desktop utility for browsing exported ChatGPT conver
 4. **Browse & search**
    - Click a title in the left pane to render the full thread.
    - Use the search box to locate phrases across all conversations; matching text is highlighted in the detail pane.
+
+## Configuration (.env)
+- The app reads a `.env` file from the project root on startup (existing environment variables take priority).
+- Edit `.env` to configure:
+  - `OPENAI_API_KEY`, `OPENAI_EMBEDDINGS_MODEL`, `OPENAI_BASE_URL`
+  - `CHAT_HISTORY_VECTOR_EXTENSION`, `CHAT_HISTORY_VECTOR_BACKEND`
+  - `CHAT_HISTORY_EMBEDDING_MAX_CHARS`
+
+## Semantic Search (Optional)
+1. Install a SQLite vector extension and set `CHAT_HISTORY_VECTOR_EXTENSION` to its file path.
+   - For multiple extensions (for example `vector0` + `vss0`), separate paths with `;` and list `vector0` first.
+   - Supported backends: `sqlite-vec` (default) or `sqlite-vss` via `CHAT_HISTORY_VECTOR_BACKEND`.
+2. Set `OPENAI_API_KEY` (and optionally `OPENAI_EMBEDDINGS_MODEL`).
+   - Long messages are chunked before embedding; override the chunk size with `CHAT_HISTORY_EMBEDDING_MAX_CHARS` (default 8000).
+3. Use *Tools -> Build embeddings...* to generate vectors for messages.
+4. Toggle **Semantic** in the search bar to use embedding search.
 
 ## Data Storage
 - The application stores imported data in `chat_history.db` in the project root.

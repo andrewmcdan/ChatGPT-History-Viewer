@@ -18,6 +18,7 @@ dist/
 # Local data files
 chat_history.db*
 conversations.json
+.env
 
 # IDE settings
 .idea/
