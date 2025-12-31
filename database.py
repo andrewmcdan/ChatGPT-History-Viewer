@@ -731,7 +731,13 @@ class ChatHistoryDatabase:
             if total_embeddings == 0:
                 raise RuntimeError("No embeddings found. Build embeddings first.")
 
-            match_clause = "vss_search(v.embedding, ?)" if backend == "vss" else "v.embedding MATCH ?"
+            if backend == "vss":
+                match_clause = "vss_search(v.embedding, ?)"
+                params: List[Any] = [vector_blob, message_limit]
+            else:
+                match_clause = "v.embedding MATCH ? AND k = ?"
+                params = [vector_blob, message_limit, message_limit]
+
             sql = f"""
                 WITH matches AS (
                     SELECT map.conversation_id, v.distance
@@ -752,7 +758,6 @@ class ChatHistoryDatabase:
                 JOIN conversations c
                     ON c.conversation_id = matches.conversation_id
             """
-            params: List[Any] = [vector_blob, message_limit]
             if project_id:
                 sql += " WHERE c.project_id = ?"
                 params.append(project_id)
